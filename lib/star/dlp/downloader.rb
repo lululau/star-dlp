@@ -4,6 +4,7 @@ require "github_api"
 require "json"
 require "fileutils"
 require "time"
+require "base64"
 
 module Star
   module Dlp
@@ -32,17 +33,12 @@ module Star
       
       def download
         puts "Downloading stars for user: #{username}"
-        
-        # Get existing stars from JSON files
-        existing_stars = get_existing_stars
-        existing_star_map = existing_stars.each_with_object({}) do |star, hash|
-          hash[star[:id]] = star
-        end
-        
-        # Get last downloaded repo if available
+        # Get last downloaded info
         last_repo_name = get_last_repo_name
+        
         if last_repo_name
-          puts "Last download stopped at repository: #{last_repo_name}. Will only fetch stars added after this repo."
+          puts "Last download stopped at repository: #{last_repo_name}."
+          puts "Will only fetch stars added after this timestamp."
         else
           puts "No previous download record found. Will download all stars."
         end
@@ -51,93 +47,75 @@ module Star
         all_stars = []
         page = 1
         newest_repo_name = nil
+        newest_starred_at = nil
         
         # Download stars page by page
         loop do
           puts "Fetching page #{page}..."
           stars = github.activity.starring.starred(user: username, per_page: 100, page: page)
           break if stars.empty?
+
+          puts "  - Got #{stars.size} repositories from page #{page}"
           
-          # Store the name of the newest star (first star on first page)
+          # Store the name and starred_at of the newest star (first star on first page)
           if page == 1 && !stars.empty?
             newest_repo = stars.first
-            newest_repo_name = newest_repo.full_name if newest_repo.respond_to?(:full_name)
+            newest_repo_name = get_repo_full_name(newest_repo)
+            newest_starred_at = newest_repo.respond_to?(:starred_at) ? newest_repo.starred_at : nil
+            
+            puts "Newest starred repository: #{newest_repo_name} (starred at: #{newest_starred_at || 'unknown'})"
           end
           
           # Check if we've reached repos that were already downloaded
           should_break = false
+          
+          # If we have both last_repo_name, we can use them for comparison
           if last_repo_name
             stars.each do |star|
-              if star.respond_to?(:full_name) && star.full_name == last_repo_name
-                puts "  - Reached previously downloaded repository: #{last_repo_name}. Stopping pagination."
+              repo_name = get_repo_full_name(star)
+              starred_at = star.respond_to?(:starred_at) ? star.starred_at : nil
+              
+              # If we find a star with the same name and timestamp, we've reached our previous download point
+              if repo_name == last_repo_name
+                puts "  - Reached previously downloaded repository: #{repo_name} (starred at: #{starred_at})"
+                puts "  - Stopping pagination."
                 should_break = true
                 break
               end
+              all_stars << star
             end
+          else
+            all_stars.concat(stars)
           end
           
-          puts "  - Got #{stars.size} repositories from page #{page}"
-          all_stars.concat(stars.to_a)
           page += 1
           
           break if should_break
         end
         
-        puts "Found #{all_stars.size} starred repositories to process"
-        
-        # Separate stars into new and existing
-        new_stars = []
-        updated_stars = []
-        
-        all_stars.each do |star|
-          if existing_star_map.key?(star.id)
-            # Check if the star has been updated
-            existing_star = existing_star_map[star.id]
-            if star_needs_update?(star, existing_star)
-              updated_stars << star
-            end
-          else
-            new_stars << star
-          end
-        end
+        # Filter out stars that already exist in our collection
+        new_stars = all_stars
         
         puts "Found #{new_stars.size} new starred repositories to download"
-        puts "Found #{updated_stars.size} existing repositories that need updates"
         
         # Save new stars
         if new_stars.any?
           puts "Downloading new repositories:"
           new_stars.each_with_index do |star, index|
-            puts "  [#{index + 1}/#{new_stars.size}] Downloading: #{star.full_name}"
+            puts "  [#{index + 1}/#{new_stars.size}] Downloading: #{get_repo_full_name(star)}"
             save_star_as_json(star)
             save_star_as_markdown(star)
           end
+          
+          puts "Download completed successfully!"
         else
           puts "No new repositories to download."
         end
         
-        # Update existing stars
-        if updated_stars.any?
-          puts "Updating existing repositories:"
-          updated_stars.each_with_index do |star, index|
-            puts "  [#{index + 1}/#{updated_stars.size}] Updating: #{star.full_name}"
-            save_star_as_json(star)
-            save_star_as_markdown(star)
-          end
-        else
-          puts "No existing repositories need updates."
-        end
-        
-        # Save the newest repo name for next time
+        # Save the newest repo info for next time
         if newest_repo_name
           save_last_repo_name(newest_repo_name)
           puts "Saved latest repository name: #{newest_repo_name}"
-        end
-        
-        if new_stars.any? || updated_stars.any?
-          puts "Download and update completed successfully!"
-        else
-          puts "All repositories are up to date."
         end
       end
       
@@ -155,69 +133,226 @@ module Star
         File.write(last_repo_file, repo_name)
       end
       
-      def star_needs_update?(current_star, existing_star)
-        # Convert to hash for easier comparison
-        current_data = current_star.to_hash
-        
-        # Check for changes in key attributes
-        return true if current_data[:stargazers_count] != existing_star[:stargazers_count]
-        return true if current_data[:forks_count] != existing_star[:forks_count]
-        return true if current_data[:updated_at] != existing_star[:updated_at]
-        return true if current_data[:description] != existing_star[:description]
-        return true if current_data[:topics] != existing_star[:topics]
-        
-        # No significant changes detected
-        false
-      end
-      
-      def get_existing_stars
-        return [] unless Dir.exist?(config.json_dir)
-        
-        json_files = Dir.glob(File.join(config.json_dir, "*.json"))
-        json_files.map do |file|
-          JSON.parse(File.read(file), symbolize_names: true)
-        end
-      end
       
       def save_star_as_json(star)
         star_data = star.to_hash
-        filename = "#{star.id}.json"
-        filepath = File.join(config.json_dir, filename)
         
+        # Get starred_at date or use current date as fallback
+        starred_at = star.respond_to?(:starred_at) ? Time.parse(star.starred_at) : Time.now
+        
+        # Create directory structure based on starred_at date: json/YYYY/MM/
+        year_dir = starred_at.strftime("%Y")
+        month_dir = starred_at.strftime("%m")
+        target_dir = File.join(config.json_dir, year_dir, month_dir)
+        FileUtils.mkdir_p(target_dir) unless Dir.exist?(target_dir)
+        
+        # Format filename: YYYYMMDD.username.repo_name.json
+        date_str = starred_at.strftime("%Y%m%d")
+        repo_name = get_repo_full_name(star).gsub('/', '.')
+        filename = "#{date_str}.#{repo_name}.json"
+        
+        filepath = File.join(target_dir, filename)
         File.write(filepath, JSON.pretty_generate(star_data))
       end
       
       def save_star_as_markdown(star)
-        filename = "#{star.full_name.gsub('/', '-')}.md"
-        filepath = File.join(config.markdown_dir, filename)
+        # Get starred_at date or use current date as fallback
+        starred_at = star.respond_to?(:starred_at) ? Time.parse(star.starred_at) : Time.now
         
-        # Include starred_at in the markdown if available
-        starred_at = star.respond_to?(:starred_at) ? star.starred_at : "N/A"
+        # Create directory structure based on starred_at date: markdown/YYYY/MM/
+        year_dir = starred_at.strftime("%Y")
+        month_dir = starred_at.strftime("%m")
+        target_dir = File.join(config.markdown_dir, year_dir, month_dir)
+        FileUtils.mkdir_p(target_dir) unless Dir.exist?(target_dir)
         
+        # Format filename: YYYYMMDD.username.repo_name.md
+        date_str = starred_at.strftime("%Y%m%d")
+        repo_full_name = get_repo_full_name(star)
+        repo_name = repo_full_name.gsub('/', '.')
+        filename = "#{date_str}.#{repo_name}.md"
+        
+        filepath = File.join(target_dir, filename)
+        
+        # Include starred_at in the markdown
+        starred_at_str = star.respond_to?(:starred_at) ? star.starred_at : "N/A"
+        
+        # Basic repository information
         content = <<~MARKDOWN
-          # #{star.full_name}
+          # #{repo_full_name}
           
-          #{star.description}
+          #{get_description(star)}
           
-          - **Stars**: #{star.stargazers_count}
-          - **Forks**: #{star.forks_count}
-          - **Language**: #{star.language}
-          - **Created at**: #{star.created_at}
-          - **Updated at**: #{star.updated_at}
-          - **Starred at**: #{starred_at}
+          - **Stars**: #{get_stargazers_count(star)}
+          - **Forks**: #{get_forks_count(star)}
+          - **Language**: #{get_language(star)}
+          - **Created at**: #{get_created_at(star)}
+          - **Updated at**: #{get_updated_at(star)}
+          - **Starred at**: #{starred_at_str}
           
-          [View on GitHub](#{star.html_url})
+          [View on GitHub](#{get_html_url(star)})
           
           ## Topics
           
-          #{(star.topics || []).map { |topic| "- #{topic}" }.join("\n")}
-          
-          ## Description
-          
-          #{star.description}
+          #{(get_topics(star) || []).map { |topic| "- #{topic}" }.join("\n")}
         MARKDOWN
         
+        # Try to fetch README.md content
+        readme_content = fetch_readme(repo_full_name)
+        if readme_content
+          content += "\n\n## README\n\n#{readme_content}\n"
+        else
+          content += "\n\n## Description\n\n#{get_description(star)}\n"
+        end
+        
         File.write(filepath, content)
+      end
+      
+      # Helper methods to safely access star properties
+      def get_repo_full_name(star)
+        if star.respond_to?(:repo) && star.repo.respond_to?(:full_name)
+          star.repo.full_name
+        elsif star.respond_to?(:full_name)
+          star.full_name
+        else
+          "unknown/unknown"
+        end
+      end
+      
+      def get_description(star)
+        if star.respond_to?(:repo) && star.repo.respond_to?(:description)
+          star.repo.description
+        elsif star.respond_to?(:description)
+          star.description
+        else
+          ""
+        end
+      end
+      
+      def get_stargazers_count(star)
+        if star.respond_to?(:repo) && star.repo.respond_to?(:stargazers_count)
+          star.repo.stargazers_count
+        elsif star.respond_to?(:stargazers_count)
+          star.stargazers_count
+        else
+          0
+        end
+      end
+      
+      def get_forks_count(star)
+        if star.respond_to?(:repo) && star.repo.respond_to?(:forks_count)
+          star.repo.forks_count
+        elsif star.respond_to?(:forks_count)
+          star.forks_count
+        else
+          0
+        end
+      end
+      
+      def get_language(star)
+        if star.respond_to?(:repo) && star.repo.respond_to?(:language)
+          star.repo.language
+        elsif star.respond_to?(:language)
+          star.language
+        else
+          "Unknown"
+        end
+      end
+      
+      def get_created_at(star)
+        if star.respond_to?(:repo) && star.repo.respond_to?(:created_at)
+          star.repo.created_at
+        elsif star.respond_to?(:created_at)
+          star.created_at
+        else
+          "Unknown"
+        end
+      end
+      
+      def get_updated_at(star)
+        if star.respond_to?(:repo) && star.repo.respond_to?(:updated_at)
+          star.repo.updated_at
+        elsif star.respond_to?(:updated_at)
+          star.updated_at
+        else
+          "Unknown"
+        end
+      end
+      
+      def get_html_url(star)
+        if star.respond_to?(:repo) && star.repo.respond_to?(:html_url)
+          star.repo.html_url
+        elsif star.respond_to?(:html_url)
+          star.html_url
+        else
+          "https://github.com"
+        end
+      end
+      
+      def get_topics(star)
+        if star.respond_to?(:repo) && star.repo.respond_to?(:topics)
+          star.repo.topics
+        elsif star.respond_to?(:topics)
+          star.topics
+        else
+          []
+        end
+      end
+      
+      # Fetch README.md content from GitHub
+      def fetch_readme(repo_full_name)
+        begin
+          # Get README content using GitHub API
+          response = github.repos.contents.get(
+            user: repo_full_name.split('/').first,
+            repo: repo_full_name.split('/').last,
+            path: 'README.md'
+          )
+          
+          # Decode content from Base64
+          if response.content && response.encoding == 'base64'
+            return Base64.decode64(response.content).force_encoding('UTF-8')
+          end
+        rescue Github::Error::NotFound
+          # Try README.markdown if README.md not found
+          begin
+            response = github.repos.contents.get(
+              user: repo_full_name.split('/').first,
+              repo: repo_full_name.split('/').last,
+              path: 'README.markdown'
+            )
+            
+            if response.content && response.encoding == 'base64'
+              return Base64.decode64(response.content).force_encoding('UTF-8')
+            end
+          rescue Github::Error::NotFound
+            # Try readme.md (lowercase) if previous attempts failed
+            begin
+              response = github.repos.contents.get(
+                user: repo_full_name.split('/').first,
+                repo: repo_full_name.split('/').last,
+                path: 'readme.md'
+              )
+              
+              if response.content && response.encoding == 'base64'
+                return Base64.decode64(response.content).force_encoding('UTF-8')
+              end
+            rescue Github::Error::NotFound
+              # README not found
+              return nil
+            rescue => e
+              puts "Error fetching lowercase readme.md for #{repo_full_name}: #{e.message}"
+              return nil
+            end
+          rescue => e
+            puts "Error fetching README.markdown for #{repo_full_name}: #{e.message}"
+            return nil
+          end
+        rescue => e
+          puts "Error fetching README.md for #{repo_full_name}: #{e.message}"
+          return nil
+        end
+        
+        nil
       end
     end
   end

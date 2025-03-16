@@ -1,0 +1,76 @@
+#!/usr/bin/env bash
+
+# fetch-github-stars - A script to fetch the first page of GitHub stars for a user
+# Usage: ./fetch-github-stars <username> [token]
+
+set -e
+
+# Default values
+PER_PAGE=1
+USERNAME=""
+TOKEN=""
+OUTPUT_FILE=""
+
+# Parse command line arguments
+while [[ $# -gt 0 ]]; do
+  case $1 in
+    -u|--username)
+      USERNAME="$2"
+      shift 2
+      ;;
+    -t|--token)
+      TOKEN="$2"
+      shift 2
+      ;;
+    -o|--output)
+      OUTPUT_FILE="$2"
+      shift 2
+      ;;
+    -p|--per-page)
+      PER_PAGE="$2"
+      shift 2
+      ;;
+    -h|--help)
+      echo "Usage: $0 [options]"
+      echo "Options:"
+      echo "  -u, --username USERNAME   GitHub username (required)"
+      echo "  -t, --token TOKEN         GitHub personal access token"
+      echo "  -o, --output FILE         Output file (default: stdout)"
+      echo "  -p, --per-page NUMBER     Number of results per page (default: 1)"
+      echo "  -h, --help                Show this help message"
+      exit 0
+      ;;
+    *)
+      echo "Unknown option: $1"
+      exit 1
+      ;;
+  esac
+done
+
+# Check if username is provided
+if [ -z "$USERNAME" ]; then
+  echo "Error: GitHub username is required"
+  echo "Use -h or --help for usage information"
+  exit 1
+fi
+
+# Prepare the GitHub API URL
+# Using the starred endpoint with the correct Accept header to include starred_at
+API_URL="https://api.github.com/users/$USERNAME/starred?per_page=$PER_PAGE"
+
+# Prepare headers
+# The "application/vnd.github.star+json" media type is required to include starred_at
+HEADERS=("Accept:application/vnd.github.star+json" "X-GitHub-Api-Version:2022-11-28")
+
+# Add authorization header if token is provided
+if [ -n "$TOKEN" ]; then
+  HEADERS+=("Authorization:Bearer $TOKEN")
+fi
+
+# Fetch the stars
+if [ -n "$OUTPUT_FILE" ]; then
+  xh --pretty=format "$API_URL" "${HEADERS[@]}" > "$OUTPUT_FILE"
+  echo "GitHub stars for $USERNAME saved to $OUTPUT_FILE"
+else
+  xh --pretty=format "$API_URL" "${HEADERS[@]}"
+fi 
