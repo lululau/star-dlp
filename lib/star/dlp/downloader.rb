@@ -5,6 +5,7 @@ require "json"
 require "fileutils"
 require "time"
 require "base64"
+require "thread"
 
 module Star
   module Dlp
@@ -12,10 +13,14 @@ module Star
       attr_reader :config, :github, :username
       
       LAST_REPO_FILE = "last_downloaded_repo.txt"
+      DEFAULT_THREAD_COUNT = 2
+      DEFAULT_RETRY_COUNT = 5
+      DEFAULT_RETRY_DELAY = 1 # seconds
       
-      def initialize(config, username)
+      def initialize(config, username, thread_count: DEFAULT_THREAD_COUNT)
         @config = config
         @username = username
+        @thread_count = thread_count
         
         # Initialize GitHub API client with the special Accept header for starred_at field
         options = {
@@ -98,14 +103,71 @@ module Star
         
         puts "Found #{new_stars.size} new starred repositories to download"
         
-        # Save new stars
+        # Save new stars using multiple threads
         if new_stars.any?
-          puts "Downloading new repositories:"
-          new_stars.each_with_index do |star, index|
-            puts "  [#{index + 1}/#{new_stars.size}] Downloading: #{get_repo_full_name(star)}"
-            save_star_as_json(star)
-            save_star_as_markdown(star)
+          puts "Downloading new repositories using #{@thread_count} threads:"
+          
+          # Create a thread-safe queue for the stars
+          queue = Queue.new
+          new_stars.each { |star| queue << star }
+          
+          # Create a mutex for thread-safe output
+          mutex = Mutex.new
+          
+          # Create a progress counter
+          total = new_stars.size
+          completed = 0
+          
+          # Create and start the worker threads
+          threads = Array.new(@thread_count) do
+            Thread.new do
+              until queue.empty?
+                # Try to get a star from the queue (non-blocking)
+                star = queue.pop(true) rescue nil
+                break unless star
+                
+                # Get the repository name for logging
+                repo_name = get_repo_full_name(star)
+                
+                # Process the star with retry mechanism
+                success = false
+                retry_count = 0
+                
+                until success || retry_count >= DEFAULT_RETRY_COUNT
+                  begin
+                    # Save the star as JSON and Markdown
+                    save_star_as_json(star)
+                    save_star_as_markdown(star)
+                    success = true
+                  rescue => e
+                    retry_count += 1
+                    
+                    # Log the error and retry information
+                    mutex.synchronize do
+                      puts "  Error downloading #{repo_name}: #{e.message}"
+                      if retry_count < DEFAULT_RETRY_COUNT
+                        puts "  Retrying in #{DEFAULT_RETRY_DELAY} seconds (attempt #{retry_count + 1}/#{DEFAULT_RETRY_COUNT})..."
+                      else
+                        puts "  Failed to download after #{DEFAULT_RETRY_COUNT} attempts."
+                      end
+                    end
+                    
+                    # Wait before retrying
+                    sleep(DEFAULT_RETRY_DELAY)
+                  end
+                end
+                
+                # Update progress
+                mutex.synchronize do
+                  completed += 1
+                  puts "  [#{completed}/#{total}] Downloaded: #{repo_name} (#{(completed.to_f / total * 100).round(1)}%)"
+                end
+              end
+            end
           end
+          
+          # Wait for all threads to complete
+          threads.each(&:join)
           
           puts "Download completed successfully!"
         else
@@ -172,6 +234,8 @@ module Star
         filename = "#{date_str}.#{repo_name}.md"
         
         filepath = File.join(target_dir, filename)
+
+        return if File.exist?(filepath)
         
         # Include starred_at in the markdown
         starred_at_str = star.respond_to?(:starred_at) ? star.starred_at : "N/A"
@@ -341,18 +405,16 @@ module Star
               return nil
             rescue => e
               puts "Error fetching lowercase readme.md for #{repo_full_name}: #{e.message}"
-              return nil
+              raise e
             end
           rescue => e
             puts "Error fetching README.markdown for #{repo_full_name}: #{e.message}"
-            return nil
+            raise e
           end
         rescue => e
           puts "Error fetching README.md for #{repo_full_name}: #{e.message}"
-          return nil
+          raise e
         end
-        
-        nil
       end
     end
   end
