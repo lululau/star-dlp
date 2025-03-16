@@ -2,10 +2,12 @@
 
 require "github_api"
 require "json"
+require "tempfile"
 require "fileutils"
 require "time"
 require "base64"
 require "thread"
+require "open3"
 
 module Star
   module Dlp
@@ -17,6 +19,33 @@ module Star
       DEFAULT_THREAD_COUNT = 16
       DEFAULT_RETRY_COUNT = 5
       DEFAULT_RETRY_DELAY = 1 # seconds
+      
+      # Supported README formats in order of preference
+      README_FORMATS = [
+        "README.md",
+        "README.markdown",
+        "readme.md",
+        "README.org",
+        "README.rst",
+        "README.txt",
+        "README.rdoc",
+        "README.adoc",
+        "README",
+        "readme.org",
+        "readme.rst",
+        "readme.txt",
+        "readme.rdoc",
+        "readme.adoc",
+        "readme"
+      ]
+      
+      # Formats that need conversion to markdown
+      FORMATS_NEEDING_CONVERSION = {
+        ".org" => "org",
+        ".rst" => "rst",
+        ".txt" => "txt",
+        "" => "txt"  # For files without extension
+      }
       
       def initialize(config, username, thread_count: DEFAULT_THREAD_COUNT, skip_readme: false, retry_count: DEFAULT_RETRY_COUNT, retry_delay: DEFAULT_RETRY_DELAY)
         @config = config
@@ -209,9 +238,9 @@ module Star
           ->(repo) { repo }, # Item name is the repo name itself
           ->(repo_full_name) {
             # Try to download README
-            readme_content = fetch_readme(repo_full_name)
+            readme_result = fetch_readme(repo_full_name)
             
-            if readme_content
+            if readme_result && readme_result[:content]
               # Get starred_at date if available, or use current date as fallback
               date = nil
               if repo_dates.key?(repo_full_name) && repo_dates[repo_full_name]
@@ -232,7 +261,9 @@ module Star
                 if File.exist?(md_filepath)
                   # Append README content to existing file
                   File.open(md_filepath, 'a') do |file|
-                    file.puts "\n\n## README\n\n#{readme_content}\n"
+                    file.puts "\n\n## README"
+                    file.puts "\n*Format: #{readme_result[:format]}*\n" if readme_result[:format] != "markdown"
+                    file.puts "\n#{readme_result[:content]}\n"
                   end
                 else
                   # Create new file with repository information and README
@@ -245,9 +276,13 @@ module Star
                     [View on GitHub](https://github.com/#{repo_full_name})
                     
                     ## README
-                    
-                    #{readme_content}
                   MARKDOWN
+                  
+                  # Add format note if not markdown
+                  content += "\n*Format: #{readme_result[:format]}*\n" if readme_result[:format] != "markdown"
+                  
+                  # Add README content
+                  content += "\n#{readme_result[:content]}\n"
                   
                   File.write(md_filepath, content)
                 end
@@ -282,61 +317,90 @@ module Star
         }
       end
       
-      # Fetch README.md content from GitHub
+      # Fetch README content from GitHub
+      # Returns a hash with :content and :format keys, or nil if not found
       def fetch_readme(repo_full_name)
-        begin
-          # Get README content using GitHub API
-          response = github.repos.contents.get(
-            user: repo_full_name.split('/').first,
-            repo: repo_full_name.split('/').last,
-            path: 'README.md'
-          )
-          
-          # Decode content from Base64
-          if response.content && response.encoding == 'base64'
-            return Base64.decode64(response.content).force_encoding('UTF-8')
-          end
-        rescue Github::Error::NotFound
-          # Try README.markdown if README.md not found
+        # Try each README format in order
+        README_FORMATS.each do |readme_path|
           begin
+            # Get README content using GitHub API
             response = github.repos.contents.get(
               user: repo_full_name.split('/').first,
               repo: repo_full_name.split('/').last,
-              path: 'README.markdown'
+              path: readme_path
             )
             
+            # Decode content from Base64
             if response.content && response.encoding == 'base64'
-              return Base64.decode64(response.content).force_encoding('UTF-8')
+              content = Base64.decode64(response.content).force_encoding('UTF-8')
+              
+              # Get file extension
+              ext = File.extname(readme_path).downcase
+              
+              # Check if we need to convert the content
+              if FORMATS_NEEDING_CONVERSION.key?(ext)
+                format = FORMATS_NEEDING_CONVERSION[ext]
+                puts "Converting #{readme_path} from #{format} to markdown for #{repo_full_name}"
+                
+                # Create a temporary file with the content
+                temp_file = Tempfile.new(['readme', ".#{format}"])
+                begin
+                  temp_file.write(content)
+                  temp_file.close
+                  
+                  # Use pandoc to convert to markdown
+                  markdown_content, status = convert_to_markdown(temp_file.path, format)
+                  
+                  if status.success?
+                    return { content: markdown_content, format: format }
+                  else
+                    puts "Pandoc conversion failed for #{repo_full_name}, using original content"
+                    return { content: content, format: format }
+                  end
+                ensure
+                  temp_file.unlink
+                end
+              else
+                # Already markdown, no conversion needed
+                return { content: content, format: "markdown" }
+              end
             end
           rescue Github::Error::NotFound
-            # Try readme.md (lowercase) if previous attempts failed
-            begin
-              response = github.repos.contents.get(
-                user: repo_full_name.split('/').first,
-                repo: repo_full_name.split('/').last,
-                path: 'readme.md'
-              )
-              
-              if response.content && response.encoding == 'base64'
-                return Base64.decode64(response.content).force_encoding('UTF-8')
-              end
-            rescue Github::Error::NotFound
-              # README not found
-              return nil
-            rescue => e
-              puts "Error fetching lowercase readme.md for #{repo_full_name}: #{e.message}"
-              raise e
-            end
+            # Try next format
+            next
           rescue => e
-            puts "Error fetching README.markdown for #{repo_full_name}: #{e.message}"
-            raise e
+            puts "Error fetching #{readme_path} for #{repo_full_name}: #{e.message}"
+            next
           end
-        rescue => e
-          puts "Error fetching README.md for #{repo_full_name}: #{e.message}"
-          raise e
         end
         
+        # No README found in any format
         nil
+      end
+      
+      # Convert content from a given format to markdown using pandoc
+      def convert_to_markdown(file_path, format)
+        begin
+          # Check if pandoc is installed
+          version_output, status = Open3.capture2e("pandoc --version")
+          unless status.success?
+            puts "Warning: pandoc is not installed or not in PATH. Cannot convert non-markdown formats."
+            return [File.read(file_path), status]
+          end
+          
+          # Use pandoc to convert to markdown
+          output, status = Open3.capture2e("pandoc", "-f", format, "-t", "markdown", file_path)
+          
+          if status.success?
+            return [output, status]
+          else
+            puts "Pandoc conversion failed: #{output}"
+            return [File.read(file_path), status]
+          end
+        rescue => e
+          puts "Error during conversion: #{e.message}"
+          return [File.read(file_path), OpenStruct.new(success?: false)]
+        end
       end
       
       private
@@ -513,9 +577,12 @@ module Star
         
         # Try to fetch README.md content if not skipped
         unless @skip_readme
-          readme_content = fetch_readme(repo_full_name)
-          if readme_content
-            content += "\n\n## README\n\n#{readme_content}\n"
+          readme_result = fetch_readme(repo_full_name)
+          if readme_result && readme_result[:content]
+            content += "\n\n## README"
+            # Add format note if not markdown
+            content += "\n*Format: #{readme_result[:format]}*\n" if readme_result[:format] != "markdown"
+            content += "\n#{readme_result[:content]}\n"
           else
             content += "\n\n## Description\n\n#{get_description(star)}\n"
           end
