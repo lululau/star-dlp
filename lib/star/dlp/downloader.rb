@@ -13,14 +13,18 @@ module Star
       attr_reader :config, :github, :username
       
       LAST_REPO_FILE = "last_downloaded_repo.txt"
-      DEFAULT_THREAD_COUNT = 2
+      DOWNLOADED_READMES_FILE = "downloaded_readmes.txt"
+      DEFAULT_THREAD_COUNT = 16
       DEFAULT_RETRY_COUNT = 5
       DEFAULT_RETRY_DELAY = 1 # seconds
       
-      def initialize(config, username, thread_count: DEFAULT_THREAD_COUNT)
+      def initialize(config, username, thread_count: DEFAULT_THREAD_COUNT, skip_readme: false, retry_count: DEFAULT_RETRY_COUNT, retry_delay: DEFAULT_RETRY_DELAY)
         @config = config
         @username = username
         @thread_count = thread_count
+        @skip_readme = skip_readme
+        @retry_count = retry_count
+        @retry_delay = retry_delay
         
         # Initialize GitHub API client with the special Accept header for starred_at field
         options = {
@@ -107,67 +111,15 @@ module Star
         if new_stars.any?
           puts "Downloading new repositories using #{@thread_count} threads:"
           
-          # Create a thread-safe queue for the stars
-          queue = Queue.new
-          new_stars.each { |star| queue << star }
-          
-          # Create a mutex for thread-safe output
-          mutex = Mutex.new
-          
-          # Create a progress counter
-          total = new_stars.size
-          completed = 0
-          
-          # Create and start the worker threads
-          threads = Array.new(@thread_count) do
-            Thread.new do
-              until queue.empty?
-                # Try to get a star from the queue (non-blocking)
-                star = queue.pop(true) rescue nil
-                break unless star
-                
-                # Get the repository name for logging
-                repo_name = get_repo_full_name(star)
-                
-                # Process the star with retry mechanism
-                success = false
-                retry_count = 0
-                
-                until success || retry_count >= DEFAULT_RETRY_COUNT
-                  begin
-                    # Save the star as JSON and Markdown
-                    save_star_as_json(star)
-                    save_star_as_markdown(star)
-                    success = true
-                  rescue => e
-                    retry_count += 1
-                    
-                    # Log the error and retry information
-                    mutex.synchronize do
-                      puts "  Error downloading #{repo_name}: #{e.message}"
-                      if retry_count < DEFAULT_RETRY_COUNT
-                        puts "  Retrying in #{DEFAULT_RETRY_DELAY} seconds (attempt #{retry_count + 1}/#{DEFAULT_RETRY_COUNT})..."
-                      else
-                        puts "  Failed to download after #{DEFAULT_RETRY_COUNT} attempts."
-                      end
-                    end
-                    
-                    # Wait before retrying
-                    sleep(DEFAULT_RETRY_DELAY)
-                  end
-                end
-                
-                # Update progress
-                mutex.synchronize do
-                  completed += 1
-                  puts "  [#{completed}/#{total}] Downloaded: #{repo_name} (#{(completed.to_f / total * 100).round(1)}%)"
-                end
-              end
-            end
-          end
-          
-          # Wait for all threads to complete
-          threads.each(&:join)
+          # Process stars with multithreading
+          process_items_with_threads(
+            new_stars,
+            ->(star) { get_repo_full_name(star) },
+            ->(star) {
+              save_star_as_json(star)
+              save_star_as_markdown(star)
+            }
+          )
           
           puts "Download completed successfully!"
         else
@@ -181,7 +133,319 @@ module Star
         end
       end
       
+      # Download READMEs for all repositories from JSON files
+      def download_readmes(force: false)
+        puts "Downloading READMEs for repositories from JSON files"
+        
+        # File to track repositories with downloaded READMEs
+        downloaded_readmes_file = File.join(config.output_dir, DOWNLOADED_READMES_FILE)
+        
+        # Load list of repositories with already downloaded READMEs
+        downloaded_repos = Set.new
+        if File.exist?(downloaded_readmes_file) && !force
+          File.readlines(downloaded_readmes_file).each do |line|
+            downloaded_repos.add(line.strip)
+          end
+          puts "Found #{downloaded_repos.size} repositories with already downloaded READMEs"
+        end
+        
+        # Find all JSON files in the json directory
+        json_files = Dir.glob(File.join(config.json_dir, "**", "*.json"))
+        puts "Found #{json_files.size} JSON files"
+        
+        # Extract repository names from JSON files
+        repos_to_process = []
+        repo_dates = {} # Store starred_at dates for repositories
+        
+        json_files.each do |json_file|
+          begin
+            data = JSON.parse(File.read(json_file))
+            
+            # Extract repository full name from JSON data
+            repo_full_name = nil
+            starred_at = nil
+            
+            if data.is_a?(Hash) && data["repo"] && data["repo"]["full_name"]
+              repo_full_name = data["repo"]["full_name"]
+              starred_at = data["starred_at"] if data.key?("starred_at")
+            elsif data.is_a?(Hash) && data["full_name"]
+              repo_full_name = data["full_name"]
+              starred_at = data["starred_at"] if data.key?("starred_at")
+            elsif File.basename(json_file) =~ /(\d{8})\.(.+)\.json$/
+              # Try to extract from filename (format: YYYYMMDD.owner.repo.json)
+              date_str = $1
+              parts = $2.split('.')
+              if parts.size >= 2
+                repo_full_name = "#{parts[0]}/#{parts[1]}"
+                # Convert YYYYMMDD to ISO date format
+                if date_str =~ /^(\d{4})(\d{2})(\d{2})$/
+                  starred_at = "#{$1}-#{$2}-#{$3}T00:00:00Z"
+                end
+              end
+            end
+            
+            # Skip if we couldn't determine the repository name or if README was already downloaded
+            next if repo_full_name.nil?
+            next if downloaded_repos.include?(repo_full_name) && !force
+            
+            repos_to_process << repo_full_name
+            # Store the starred_at date if available
+            repo_dates[repo_full_name] = starred_at if starred_at
+          rescue JSON::ParserError => e
+            puts "Error parsing JSON file #{json_file}: #{e.message}"
+          end
+        end
+        
+        puts "Found #{repos_to_process.size} repositories that need README downloads"
+        
+        # Create a mutex for thread-safe file writing
+        mutex = Mutex.new
+        success_count = 0
+        failed_count = 0
+        
+        # Process repositories with multithreading
+        result = process_items_with_threads(
+          repos_to_process,
+          ->(repo) { repo }, # Item name is the repo name itself
+          ->(repo_full_name) {
+            # Try to download README
+            readme_content = fetch_readme(repo_full_name)
+            
+            if readme_content
+              # Get starred_at date if available, or use current date as fallback
+              date = nil
+              if repo_dates.key?(repo_full_name) && repo_dates[repo_full_name]
+                begin
+                  date = Time.parse(repo_dates[repo_full_name])
+                rescue
+                  date = Time.now
+                end
+              else
+                date = Time.now
+              end
+              
+              # Create markdown file path
+              md_filepath = get_markdown_filepath(repo_full_name, date)
+              
+              mutex.synchronize do
+                # Check if file exists
+                if File.exist?(md_filepath)
+                  # Append README content to existing file
+                  File.open(md_filepath, 'a') do |file|
+                    file.puts "\n\n## README\n\n#{readme_content}\n"
+                  end
+                else
+                  # Create new file with repository information and README
+                  content = <<~MARKDOWN
+                    # #{repo_full_name}
+                    
+                    - **Downloaded at**: #{Time.now.iso8601}
+                    - **Starred at**: #{date.iso8601}
+                    
+                    [View on GitHub](https://github.com/#{repo_full_name})
+                    
+                    ## README
+                    
+                    #{readme_content}
+                  MARKDOWN
+                  
+                  File.write(md_filepath, content)
+                end
+                
+                # Add to downloaded repositories list
+                File.open(downloaded_readmes_file, 'a') do |file|
+                  file.puts repo_full_name
+                end
+                
+                success_count += 1
+              end
+              
+              true
+            else
+              mutex.synchronize do
+                puts "No README found for #{repo_full_name}"
+                failed_count += 1
+              end
+              true # Mark as success even if README not found to avoid retries
+            end
+          }
+        )
+        
+        puts "README download completed!"
+        puts "Successfully downloaded: #{success_count}"
+        puts "Failed or not found: #{failed_count}"
+        
+        return {
+          total: repos_to_process.size,
+          success: success_count,
+          failed: failed_count
+        }
+      end
+      
+      # Fetch README.md content from GitHub
+      def fetch_readme(repo_full_name)
+        begin
+          # Get README content using GitHub API
+          response = github.repos.contents.get(
+            user: repo_full_name.split('/').first,
+            repo: repo_full_name.split('/').last,
+            path: 'README.md'
+          )
+          
+          # Decode content from Base64
+          if response.content && response.encoding == 'base64'
+            return Base64.decode64(response.content).force_encoding('UTF-8')
+          end
+        rescue Github::Error::NotFound
+          # Try README.markdown if README.md not found
+          begin
+            response = github.repos.contents.get(
+              user: repo_full_name.split('/').first,
+              repo: repo_full_name.split('/').last,
+              path: 'README.markdown'
+            )
+            
+            if response.content && response.encoding == 'base64'
+              return Base64.decode64(response.content).force_encoding('UTF-8')
+            end
+          rescue Github::Error::NotFound
+            # Try readme.md (lowercase) if previous attempts failed
+            begin
+              response = github.repos.contents.get(
+                user: repo_full_name.split('/').first,
+                repo: repo_full_name.split('/').last,
+                path: 'readme.md'
+              )
+              
+              if response.content && response.encoding == 'base64'
+                return Base64.decode64(response.content).force_encoding('UTF-8')
+              end
+            rescue Github::Error::NotFound
+              # README not found
+              return nil
+            rescue => e
+              puts "Error fetching lowercase readme.md for #{repo_full_name}: #{e.message}"
+              raise e
+            end
+          rescue => e
+            puts "Error fetching README.markdown for #{repo_full_name}: #{e.message}"
+            raise e
+          end
+        rescue => e
+          puts "Error fetching README.md for #{repo_full_name}: #{e.message}"
+          raise e
+        end
+        
+        nil
+      end
+      
       private
+      
+      # Process a list of items using multiple threads
+      # items: Array of items to process
+      # name_proc: Proc to get item name for logging
+      # process_proc: Proc to process each item
+      def process_items_with_threads(items, name_proc, process_proc)
+        return if items.empty?
+        
+        # Create a thread-safe queue for the items
+        queue = Queue.new
+        items.each { |item| queue << item }
+        
+        # Create a mutex for thread-safe output
+        mutex = Mutex.new
+        
+        # Create a progress counter
+        total = items.size
+        completed = 0
+        
+        # Create and start the worker threads
+        threads = Array.new(@thread_count) do
+          Thread.new do
+            until queue.empty?
+              # Try to get an item from the queue (non-blocking)
+              item = queue.pop(true) rescue nil
+              break unless item
+              
+              # Get the item name for logging
+              item_name = name_proc.call(item)
+              
+              # Process the item with retry mechanism
+              success = false
+              retry_count = 0
+              
+              until success || retry_count >= @retry_count
+                begin
+                  # Process the item
+                  process_proc.call(item)
+                  success = true
+                rescue => e
+                  retry_count += 1
+                  
+                  # Log the error and retry information
+                  mutex.synchronize do
+                    puts "  Error processing #{item_name}: #{e.message}"
+                    if retry_count < @retry_count
+                      puts "  Retrying in #{@retry_delay} seconds (attempt #{retry_count + 1}/#{@retry_count})..."
+                    else
+                      puts "  Failed to process after #{@retry_count} attempts."
+                    end
+                  end
+                  
+                  # Wait before retrying
+                  sleep(@retry_delay)
+                end
+              end
+              
+              # Update progress
+              mutex.synchronize do
+                completed += 1
+                puts "  [#{completed}/#{total}] Processed: #{item_name} (#{(completed.to_f / total * 100).round(1)}%)"
+              end
+            end
+          end
+        end
+        
+        # Wait for all threads to complete
+        threads.each(&:join)
+        
+        return {
+          total: total,
+          completed: completed
+        }
+      end
+      
+      # Get the markdown file path for a repository
+      def get_markdown_filepath(repo_full_name, date = Time.now)
+        # Create directory structure based on date: markdown/YYYY/MM/
+        year_dir = date.strftime("%Y")
+        month_dir = date.strftime("%m")
+        target_dir = File.join(config.markdown_dir, year_dir, month_dir)
+        FileUtils.mkdir_p(target_dir) unless Dir.exist?(target_dir)
+        
+        # Format filename: YYYYMMDD.repo_owner.repo_name.md
+        date_str = date.strftime("%Y%m%d")
+        repo_name = repo_full_name.gsub('/', '.')
+        filename = "#{date_str}.#{repo_name}.md"
+        
+        File.join(target_dir, filename)
+      end
+      
+      # Get the JSON file path for a repository
+      def get_json_filepath(repo_full_name, date = Time.now)
+        # Create directory structure based on date: json/YYYY/MM/
+        year_dir = date.strftime("%Y")
+        month_dir = date.strftime("%m")
+        target_dir = File.join(config.json_dir, year_dir, month_dir)
+        FileUtils.mkdir_p(target_dir) unless Dir.exist?(target_dir)
+        
+        # Format filename: YYYYMMDD.repo_owner.repo_name.json
+        date_str = date.strftime("%Y%m%d")
+        repo_name = repo_full_name.gsub('/', '.')
+        filename = "#{date_str}.#{repo_name}.json"
+        
+        File.join(target_dir, filename)
+      end
       
       def get_last_repo_name
         last_repo_file = File.join(config.output_dir, LAST_REPO_FILE)
@@ -195,25 +459,19 @@ module Star
         File.write(last_repo_file, repo_name)
       end
       
-      
       def save_star_as_json(star)
         star_data = star.to_hash
         
         # Get starred_at date or use current date as fallback
         starred_at = star.respond_to?(:starred_at) ? Time.parse(star.starred_at) : Time.now
         
-        # Create directory structure based on starred_at date: json/YYYY/MM/
-        year_dir = starred_at.strftime("%Y")
-        month_dir = starred_at.strftime("%m")
-        target_dir = File.join(config.json_dir, year_dir, month_dir)
-        FileUtils.mkdir_p(target_dir) unless Dir.exist?(target_dir)
+        # Get the repository name
+        repo_full_name = get_repo_full_name(star)
         
-        # Format filename: YYYYMMDD.username.repo_name.json
-        date_str = starred_at.strftime("%Y%m%d")
-        repo_name = get_repo_full_name(star).gsub('/', '.')
-        filename = "#{date_str}.#{repo_name}.json"
+        # Get the JSON file path
+        filepath = get_json_filepath(repo_full_name, starred_at)
         
-        filepath = File.join(target_dir, filename)
+        # Write the JSON file
         File.write(filepath, JSON.pretty_generate(star_data))
       end
       
@@ -221,20 +479,13 @@ module Star
         # Get starred_at date or use current date as fallback
         starred_at = star.respond_to?(:starred_at) ? Time.parse(star.starred_at) : Time.now
         
-        # Create directory structure based on starred_at date: markdown/YYYY/MM/
-        year_dir = starred_at.strftime("%Y")
-        month_dir = starred_at.strftime("%m")
-        target_dir = File.join(config.markdown_dir, year_dir, month_dir)
-        FileUtils.mkdir_p(target_dir) unless Dir.exist?(target_dir)
-        
-        # Format filename: YYYYMMDD.username.repo_name.md
-        date_str = starred_at.strftime("%Y%m%d")
+        # Get the repository name
         repo_full_name = get_repo_full_name(star)
-        repo_name = repo_full_name.gsub('/', '.')
-        filename = "#{date_str}.#{repo_name}.md"
         
-        filepath = File.join(target_dir, filename)
-
+        # Get the markdown file path
+        filepath = get_markdown_filepath(repo_full_name, starred_at)
+        
+        # Skip if file already exists
         return if File.exist?(filepath)
         
         # Include starred_at in the markdown
@@ -260,10 +511,14 @@ module Star
           #{(get_topics(star) || []).map { |topic| "- #{topic}" }.join("\n")}
         MARKDOWN
         
-        # Try to fetch README.md content
-        readme_content = fetch_readme(repo_full_name)
-        if readme_content
-          content += "\n\n## README\n\n#{readme_content}\n"
+        # Try to fetch README.md content if not skipped
+        unless @skip_readme
+          readme_content = fetch_readme(repo_full_name)
+          if readme_content
+            content += "\n\n## README\n\n#{readme_content}\n"
+          else
+            content += "\n\n## Description\n\n#{get_description(star)}\n"
+          end
         else
           content += "\n\n## Description\n\n#{get_description(star)}\n"
         end
@@ -359,61 +614,6 @@ module Star
           star.topics
         else
           []
-        end
-      end
-      
-      # Fetch README.md content from GitHub
-      def fetch_readme(repo_full_name)
-        begin
-          # Get README content using GitHub API
-          response = github.repos.contents.get(
-            user: repo_full_name.split('/').first,
-            repo: repo_full_name.split('/').last,
-            path: 'README.md'
-          )
-          
-          # Decode content from Base64
-          if response.content && response.encoding == 'base64'
-            return Base64.decode64(response.content).force_encoding('UTF-8')
-          end
-        rescue Github::Error::NotFound
-          # Try README.markdown if README.md not found
-          begin
-            response = github.repos.contents.get(
-              user: repo_full_name.split('/').first,
-              repo: repo_full_name.split('/').last,
-              path: 'README.markdown'
-            )
-            
-            if response.content && response.encoding == 'base64'
-              return Base64.decode64(response.content).force_encoding('UTF-8')
-            end
-          rescue Github::Error::NotFound
-            # Try readme.md (lowercase) if previous attempts failed
-            begin
-              response = github.repos.contents.get(
-                user: repo_full_name.split('/').first,
-                repo: repo_full_name.split('/').last,
-                path: 'readme.md'
-              )
-              
-              if response.content && response.encoding == 'base64'
-                return Base64.decode64(response.content).force_encoding('UTF-8')
-              end
-            rescue Github::Error::NotFound
-              # README not found
-              return nil
-            rescue => e
-              puts "Error fetching lowercase readme.md for #{repo_full_name}: #{e.message}"
-              raise e
-            end
-          rescue => e
-            puts "Error fetching README.markdown for #{repo_full_name}: #{e.message}"
-            raise e
-          end
-        rescue => e
-          puts "Error fetching README.md for #{repo_full_name}: #{e.message}"
-          raise e
         end
       end
     end

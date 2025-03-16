@@ -48,6 +48,44 @@ $ star-dlp download your_github_username
 
 This will download all your starred repositories and save them as JSON and Markdown files. If you've previously downloaded some repositories, it will only download newly starred repositories.
 
+Available options:
+- `--token`: GitHub API token
+- `--output_dir`: Output directory
+- `--json_dir`: JSON files directory
+- `--markdown_dir`: Markdown files directory
+- `--threads`: Number of download threads (default: 16)
+- `--skip_readme`: Skip downloading README files
+- `--retry_count`: Number of retry attempts for failed downloads (default: 5)
+- `--retry_delay`: Delay in seconds between retry attempts (default: 1)
+
+Example with options:
+
+```bash
+$ star-dlp download your_github_username --threads=8 --skip_readme --retry_count=3
+```
+
+### Downloading READMEs
+
+If you've already downloaded your starred repositories but want to download or update their README files separately:
+
+```bash
+$ star-dlp download_readme
+```
+
+This command will scan your JSON files directory, extract repository information, and download README files for repositories that don't already have them.
+
+Available options:
+- `--threads`: Number of download threads (default: 16)
+- `--retry_count`: Number of retry attempts for failed downloads (default: 5)
+- `--retry_delay`: Delay in seconds between retry attempts (default: 1)
+- `--force`: Force download even if README was already downloaded
+
+Example with options:
+
+```bash
+$ star-dlp download_readme --threads=8 --force
+```
+
 ### View Version
 
 ```bash
@@ -60,8 +98,10 @@ Star-DLP saves files in the following locations:
 
 - Configuration file: `~/.star-dlp/config.json`
 - Starred repositories: `~/.star-dlp/stars/`
-  - JSON files: `~/.star-dlp/stars/json/`
-  - Markdown files: `~/.star-dlp/stars/markdown/`
+  - JSON files: `~/.star-dlp/stars/json/YYYY/MM/YYYYMMDD.owner.repo.json`
+  - Markdown files: `~/.star-dlp/stars/markdown/YYYY/MM/YYYYMMDD.owner.repo.md`
+  - Last downloaded repository: `~/.star-dlp/stars/last_downloaded_repo.txt`
+  - Downloaded READMEs list: `~/.star-dlp/stars/downloaded_readmes.txt`
 
 ## Development
 
