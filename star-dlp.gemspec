@@ -31,8 +31,11 @@ Gem::Specification.new do |spec|
   spec.executables = spec.files.grep(%r{\Aexe/}) { |f| File.basename(f) }
   spec.require_paths = ["lib"]
 
-  # Uncomment to register a new dependency of your gem
-  # spec.add_dependency "example-gem", "~> 1.0"
+  # Dependencies
+  spec.add_dependency "github_api", "~> 0.19.0"
+  spec.add_dependency "thor", "~> 1.2"
+  spec.add_dependency "fileutils", "~> 1.6"
+  spec.add_dependency "json", "~> 2.6"
 
   # For more information and examples about making a new gem, check out our
   # guide at: https://bundler.io/guides/creating_gem.html
