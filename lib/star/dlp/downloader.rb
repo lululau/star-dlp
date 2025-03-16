@@ -15,8 +15,19 @@ module Star
       def initialize(config, username)
         @config = config
         @username = username
-        @github = Github.new(oauth_token: config.github_token) if config.github_token
-        @github ||= Github.new
+        
+        # Initialize GitHub API client with the special Accept header for starred_at field
+        options = {
+          headers: {
+            "Accept" => "application/vnd.github.star+json",
+            "X-GitHub-Api-Version" => "2022-11-28"
+          }
+        }
+        
+        # Add token if available
+        options[:oauth_token] = config.github_token if config.github_token
+        
+        @github = Github.new(options)
       end
       
       def download
@@ -180,6 +191,9 @@ module Star
         filename = "#{star.full_name.gsub('/', '-')}.md"
         filepath = File.join(config.markdown_dir, filename)
         
+        # Include starred_at in the markdown if available
+        starred_at = star.respond_to?(:starred_at) ? star.starred_at : "N/A"
+        
         content = <<~MARKDOWN
           # #{star.full_name}
           
@@ -190,6 +204,7 @@ module Star
           - **Language**: #{star.language}
           - **Created at**: #{star.created_at}
           - **Updated at**: #{star.updated_at}
+          - **Starred at**: #{starred_at}
           
           [View on GitHub](#{star.html_url})
           
