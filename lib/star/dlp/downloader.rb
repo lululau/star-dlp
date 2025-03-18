@@ -374,6 +374,72 @@ module Star
           end
         end
         
+        # No README found in predefined formats, check for any readme-like file in the root directory
+        begin
+          # Get repository contents
+          contents = github.repos.contents.get(
+            user: repo_full_name.split('/').first,
+            repo: repo_full_name.split('/').last,
+            path: ""  # Root directory
+          )
+          
+          # Look for any file with name matching /readme/i
+          readme_file = contents.find { |item| item.type == "file" && item.name =~ /readme/i }
+          
+          if readme_file
+            puts "Found alternative README file: #{readme_file.name} for #{repo_full_name}"
+            
+            # Get README content
+            readme_content = github.repos.contents.get(
+              user: repo_full_name.split('/').first,
+              repo: repo_full_name.split('/').last,
+              path: readme_file.name
+            )
+            
+            # Decode content from Base64
+            if readme_content.content && readme_content.encoding == 'base64'
+              content = Base64.decode64(readme_content.content).force_encoding('UTF-8')
+              
+              # Get file extension
+              ext = File.extname(readme_file.name).downcase
+              
+              # Check if we need to convert the content
+              if FORMATS_NEEDING_CONVERSION.key?(ext)
+                format = FORMATS_NEEDING_CONVERSION[ext]
+                puts "Converting #{readme_file.name} from #{format} to markdown for #{repo_full_name}"
+                
+                # Create a temporary file with the content
+                temp_file = Tempfile.new(['readme', ".#{format}"])
+                begin
+                  temp_file.write(content)
+                  temp_file.close
+                  
+                  # Use pandoc to convert to markdown
+                  markdown_content, status = convert_to_markdown(temp_file.path, format)
+                  
+                  if status.success?
+                    return { content: markdown_content, format: format }
+                  else
+                    puts "Pandoc conversion failed for #{repo_full_name}, using original content"
+                    return { content: content, format: format }
+                  end
+                ensure
+                  temp_file.unlink
+                end
+              else
+                # Determine format based on extension or default to txt
+                format = ext.empty? ? "txt" : ext[1..]
+                # Use markdown format if extension suggests it's already markdown
+                format = "markdown" if [".md", ".markdown"].include?(ext)
+                
+                return { content: content, format: format }
+              end
+            end
+          end
+        rescue => e
+          puts "Error checking root directory for README-like files for #{repo_full_name}: #{e.message}"
+        end
+        
         # No README found in any format
         nil
       end
