@@ -33,7 +33,7 @@ Gem::Specification.new do |spec|
 
   # Dependencies
   spec.add_dependency "github_api", "~> 0.19.0"
-  spec.add_dependency "multipart-post", "< 2.4.0"
+  spec.add_dependency "multipart-post", ">= 2.4.0"
   spec.add_dependency "thor", "~> 1.2"
   spec.add_dependency "fileutils", "~> 1.6"
   spec.add_dependency "json", ">= 2.6"
